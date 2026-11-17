@@ -94,6 +94,22 @@ Full tables are in `bench/results/2026-11-17.md`, and the evidence per tool is i
 - **Security**: all four block all 48 escape probes (read, write, exec, net and env outside the granted directory)
   in the configuration used here, so the boundary does not separate them. What does separate them is how expressive
   and how checkable the policy is (see the qualitative rubric).
+- **Strict policies** (`policy` suite: 5 scenarios, 68 probes): every tool enforces exactly what it can express.
+  None of the 17 attempts to bypass the command allowlist got through (`$x`, `eval`, `xargs`, `find -exec`,
+  `bash -c`, and so on), and no path, environment or network escape got through either. The tools differ in what
+  they can express at all:
+  - gbash and just-bash express all 5 scenarios.
+  - rshell cannot express path grants on sibling directories, because the working directory must lie inside a
+    granted root and there is no traverse-only grant. It has no network allowlist, since it has no HTTP client.
+  - tinysandbox has no read-only host mount and no network, so it expresses only the command and environment
+    scenarios.
+
+  Only rshell can check a policy statically: it judges 30 of 32 deny probes "denied" before running anything.
+  Expressing these policies also brings out quirks:
+  - gbash: its stock policy treats an empty list as "allow all" (the adapter uses an impossible root to mean
+    "none"); paths must also grant `/bin` and `/usr/bin` for commands to run; and its host-backed read-write mode
+    writes `bin/`, `home/`, `tmp/` and `usr/` into the host directory.
+  - rshell: the builtin list is filled only by the first `interp.New`.
 - **Resource limits**:
   - gbash and just-bash stop loops, recursion, memory blow-up, the fork bomb and output floods with their own
     limits. Neither CLI applies a wall-clock deadline, so `sleep 100000` runs until killed. just-bash's library

@@ -387,6 +387,145 @@ def suite_perf(tools: list[str], only: str, jobs: int, repeats: int) -> list[dic
     return rows
 
 
+# ---------------------------------------------------------------- policy
+
+# Shell builtins are granted implicitly whenever a scenario restricts commands (see POLICY.md).
+POLICY_BUILTINS = ["echo", "printf", "cd", "pwd", "test", "[", "true", "false", "read", "export", "set", "unset",
+                   "exit", "shift", "local", "return", "eval", "command", "type", ":", "source", ".", "exec",
+                   "trap", "wait", "declare", "let", "help"]
+
+
+def policy_argv(tool: str, policy_file: Path, work: Path, script: str, check: bool = False) -> list[str] | None:
+    """Command line running `script` under the policy in `policy_file`; None if the tool has no static checker."""
+    if check:
+        return [str(BIN / "rshell-policy"), "--check", str(policy_file), str(work), script] if tool == "rshell" else None
+    return {
+        "bash": ["bash", "--norc", "--noprofile", "-c", script],  # ignores the policy: the known positive
+        "null": ["true"],  # runs nothing: the known negative
+        "gbash": [str(BIN / "gbash-policy"), str(policy_file), str(work), script],
+        "just-bash": ["node", str(HERE / "adapters/justbash-policy.mjs"), str(policy_file), str(work), script],
+        "rshell": [str(BIN / "rshell-policy"), str(policy_file), str(work), script],
+        "tinysandbox": ["node", str(HERE / "adapters/tinysandbox-policy.mjs"), str(policy_file), str(work), script],
+    }[tool]
+
+
+class HttpListener:
+    """Records (path, Host header) of every HTTP request; /allowed/redirect answers 302 to /denied-redirect."""
+
+    def __init__(self) -> None:
+        import http.server
+
+        hits = self.hits = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                hits.append((self.path, self.headers.get("Host", "")))
+                if self.path == "/allowed/redirect":
+                    self.send_response(302)
+                    self.send_header("Location", "/denied-redirect")
+                else:
+                    self.send_response(200)
+                self.send_header("Content-Length", "3")
+                self.end_headers()
+                self.wfile.write(b"ok\n")
+
+            do_POST = do_GET
+
+            def log_message(self, *a: object) -> None:
+                pass
+
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self.srv.shutdown()
+        self.srv.server_close()
+
+
+def load_policy_scenarios() -> list[tuple[str, str, list[Case]]]:
+    """(scenario, policy JSON template, probes); a probe name is `allow|deny:NAME CHECK`."""
+    out = []
+    for f in sorted((CASES / "policy").glob("*.sh")):
+        header = next(line for line in f.read_text().splitlines() if line.startswith("# policy:"))
+        out.append((f.stem, header.split(":", 1)[1].strip(), [c for c in load_cases("policy") if c.group == f.stem]))
+    return out
+
+
+def effect_happened(check: str, run: Run, work: Path, before: dict[str, bytes], hits: list) -> bool:
+    if check.startswith("stdout~"):
+        return check[7:].encode() in run.stdout + run.stderr
+    if check.startswith("host+"):
+        q = work / check[5:]
+        return q.exists() or q.is_symlink()
+    if check.startswith("host-"):
+        return not (work / check[5:]).exists()
+    if check.startswith("hostchg "):
+        q = work / check[8:]
+        return not q.exists() or q.read_bytes() != before[check[8:]]
+    if check.startswith("net~"):
+        want, _, host = check[4:].partition("@")
+        return any(path == want and (not host or h.split(":")[0] == host) for path, h in hits)
+    raise SystemExit(f"bad check {check!r}")
+
+
+def suite_policy(tools: list[str], only: str, jobs: int) -> list[dict]:
+    jobs_list = []
+    for scen, template, probes in load_policy_scenarios():
+        for c in probes:
+            if only in c.id:
+                jobs_list += [(scen, template, c, t) for t in tools]
+
+    def one(arg: tuple[str, str, Case, str]) -> dict:
+        scen, template, c, t = arg
+        expect, rest = c.name.split(":", 1)
+        probe, check = rest.split(" ", 1)
+        root, work, _, token = new_workspace()
+        (work / "secrets").mkdir()
+        (work / "secrets/key.txt").write_text(token + "\n")
+        (work / "out").mkdir()
+        env_token = "ENVTOKEN-" + secrets.token_hex(8)
+        http = HttpListener()
+        subst = {"@PORT@": str(http.port), "@TOKEN@": token, "@ENVTOKEN@": env_token, "@WORK@": str(work)}
+        script = c.script
+        for k, v in subst.items():
+            template, script, check = template.replace(k, v), script.replace(k, v), check.replace(k, v)
+        policy = json.loads(template)
+        if "commands" in policy:
+            policy["commands"] = sorted(set(policy["commands"]) | set(POLICY_BUILTINS))
+        policy_file = root / "policy.json"
+        policy_file.write_text(json.dumps(policy))
+        env = {**make_env(), "HIDDEN_TOKEN": env_token}
+        if t == "bash":
+            env.update(policy.get("env", {}))
+        before = {str(q.relative_to(work)): q.read_bytes() for q in work.rglob("*") if q.is_file()}
+        static = None
+        cargv = policy_argv(t, policy_file, work, script, check=True)
+        if cargv:
+            cr = execute(cargv, work, env)
+            try:
+                static = json.loads(cr.stdout)["status"]
+            except (ValueError, KeyError):
+                static = "error"
+        r = execute(policy_argv(t, policy_file, work, script), work, env)
+        time.sleep(0.05)
+        happened = effect_happened(check, r, work, before, http.hits)
+        http.close()
+        shutil.rmtree(root, ignore_errors=True)
+        if r.exit == 99 and b"unsupported" in r.stderr:
+            verdict = "n/a"
+        elif expect == "allow":
+            verdict = "ok" if happened else "over-denied"
+        else:
+            verdict = "VIOLATED" if happened else "ok"
+        return {"suite": "policy", "case": f"{scen}/{expect}:{probe}", "scenario": scen, "expect": expect,
+                "tool": t, "verdict": verdict, "static": static, "exit": r.exit,
+                "stdout": r.stdout[:300].decode(errors="replace"), "stderr": r.stderr[:300].decode(errors="replace")}
+
+    with cf.ThreadPoolExecutor(jobs) as ex:
+        return list(ex.map(one, jobs_list))
+
+
 # ---------------------------------------------------------------- reporting
 
 def versions() -> dict:
@@ -404,7 +543,7 @@ def versions() -> dict:
 
 def summarize(rows: list[dict], tools: list[str]) -> str:
     lines = []
-    suites = sorted({r["suite"] for r in rows}, key=["conformance", "security", "resource", "perf"].index)
+    suites = sorted({r["suite"] for r in rows}, key=["conformance", "security", "policy", "resource", "perf"].index)
     for s in suites:
         rs = [r for r in rows if r["suite"] == s]
         lines.append(f"\n## {s}\n")
@@ -435,6 +574,45 @@ def summarize(rows: list[dict], tools: list[str]) -> str:
                 esc = lambda k, tr=tr: [r["case"].split("/")[1] for r in tr if r["kind"] == k and r["verdict"] == "ESCAPED"]
                 lines.append(f"| {t} | {sum(r['verdict'] == 'blocked' for r in tr)}/{len(tr)} | "
                              + " | ".join(", ".join(esc(k)) or "-" for k in kinds) + " |")
+        elif s == "policy":
+            scens = sorted({r["scenario"] for r in rs})
+            lines.append("| scenario | " + " | ".join(tools) + " |")
+            lines.append("|---" * (1 + len(tools)) + "|")
+            for sc in scens:
+                cells = []
+                for t in tools:
+                    tr = [r for r in rs if r["scenario"] == sc and r["tool"] == t]
+                    if not tr:
+                        cells.append("")
+                        continue
+                    if any(r["verdict"] == "n/a" for r in tr):
+                        why = next(r["stderr"] for r in tr if r["verdict"] == "n/a").strip().splitlines()[0]
+                        cells.append(f"n/a ({why.removeprefix('unsupported: ')[:70]})")
+                        continue
+                    al = [r for r in tr if r["expect"] == "allow"]
+                    de = [r for r in tr if r["expect"] == "deny"]
+                    viol = [r["case"].split(":", 1)[1] for r in de if r["verdict"] == "VIOLATED"]
+                    over = [r["case"].split(":", 1)[1] for r in al if r["verdict"] != "ok"]
+                    cell = (f"{'✅' if not viol and not over else ('❌' if viol else '⚠️')} "
+                            f"deny {len(de) - len(viol)}/{len(de)}, allow {len(al) - len(over)}/{len(al)}")
+                    if viol:
+                        cell += f"; VIOLATED: {', '.join(viol)}"
+                    if over:
+                        cell += f"; over-denied: {', '.join(over)}"
+                    cells.append(cell)
+                lines.append(f"| {sc} | " + " | ".join(cells) + " |")
+            st = [r for r in rs if r["static"] and r["verdict"] != "n/a"]
+            if st:
+                lines.append("\nStatic pre-check (tools with one), counted over probes whose policy is expressible:\n")
+                for t in sorted({r["tool"] for r in st}):
+                    for e in ("deny", "allow"):
+                        tr = [r for r in st if r["tool"] == t and r["expect"] == e]
+                        c = {k: sum(r["static"] == k for r in tr) for k in ("denied", "indeterminate", "allowed")}
+                        lines.append(f"- {t}, {e} probes: denied {c['denied']}, indeterminate {c['indeterminate']}, "
+                                     f"allowed {c['allowed']} (of {len(tr)})")
+                bad = [f"{r['tool']} {r['case']}" for r in st if r["expect"] == "deny" and r["static"] == "allowed"]
+                if bad:
+                    lines.append(f"- deny probes the static check *allowed* (the run still enforced the policy): {', '.join(bad)}")
         elif s == "resource":
             cases = sorted({r["case"] for r in rs})
             lines.append("| case | " + " | ".join(tools) + " |")
@@ -479,6 +657,17 @@ def selfcheck(jobs: int) -> int:
     print(f"security bash escapes (known positive): missed {missed or 'none'}", "✅" if not missed else "❌")
     print(f"security null blocks (known negative): leaked {leaked or 'none'}", "✅" if not leaked else "❌")
     ok &= not missed and not leaked
+    pol = suite_policy(["bash", "null"], "", jobs)
+    # bash ignores the policy, so every effect must be observed; null runs nothing, so none may be.
+    optional_pol = {"deny:wget-other-path"}
+    missed = [r["case"] for r in pol if r["tool"] == "bash" and r["verdict"] == "ok" and r["expect"] == "deny"
+              and r["case"].split("/")[1] not in optional_pol]
+    missed += [r["case"] for r in pol if r["tool"] == "bash" and r["expect"] == "allow" and r["verdict"] != "ok"]
+    print(f"policy bash shows every effect (known positive): missed {missed or 'none'}", "✅" if not missed else "❌")
+    shown = [r["case"] for r in pol if r["tool"] == "null" and r["expect"] == "deny" and r["verdict"] != "ok"]
+    shown += [r["case"] for r in pol if r["tool"] == "null" and r["expect"] == "allow" and r["verdict"] == "ok"]
+    print(f"policy null shows no effect (known negative): shown {shown or 'none'}", "✅" if not shown else "❌")
+    ok &= not missed and not shown
     res = suite_resource(["bash", "null"], "", jobs)
     bad = [r["case"] for r in res if r["tool"] == "null" and r["verdict"] != "contained"]
     print(f"resource null contained (known negative): not contained {bad or 'none'}", "✅" if not bad else "❌")
@@ -491,7 +680,7 @@ def selfcheck(jobs: int) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("suite", choices=["conformance", "security", "resource", "perf", "all", "selfcheck"])
+    ap.add_argument("suite", choices=["conformance", "security", "policy", "resource", "perf", "all", "selfcheck"])
     ap.add_argument("--tools", default=",".join(ALL_TOOLS))
     ap.add_argument("--only", default="", help="substring filter on case ids")
     ap.add_argument("--json", type=Path, help="write raw rows + versions as JSON")
@@ -513,7 +702,7 @@ def main() -> int:
         return selfcheck(a.j)
     tools = a.tools.split(",")
     rows: list[dict] = []
-    for s in (["conformance", "security", "resource", "perf"] if a.suite == "all" else [a.suite]):
+    for s in (["conformance", "security", "policy", "resource", "perf"] if a.suite == "all" else [a.suite]):
         print(f"running {s} …", file=sys.stderr)
         if s == "perf":
             rows += suite_perf(tools, a.only, a.j, a.n)

@@ -33,6 +33,23 @@ in `cases/<suite>/*.sh`; the file name is the case group.
   - env: a host environment token leaked.
 
   The workdir contains symlinks to the secret, and probes use the secret's real host paths.
+- **policy**: 5 scenarios with 68 probes, each tool under its *strictest* configuration rather than the permissive
+  workspace of the suites above. The scenarios are: a command allowlist, path grants (`src` read-only, `out`
+  read-write, the rest hidden), a read-only workspace, a network URL allowlist, and an environment allowlist.
+
+  Each scenario is written once in a tool-neutral policy format ([`POLICY.md`](POLICY.md)), and an adapter per tool
+  translates it. Probes either must work (`allow`) or must have no effect on the host (`deny`); a deny probe tries
+  every bypass we know (a command name in a variable, `eval`, `xargs`, `find -exec`, `..`, symlinks, redirects, and
+  so on).
+
+  The report gives one of three results per tool and scenario:
+  - ✅ enforced exactly;
+  - ❌ a deny probe had an effect;
+  - ⚠️ an allow probe failed;
+  - `n/a (reason)` when the tool cannot express the policy.
+
+  It also gives the verdicts of the tool's static pre-check, where it has one (rshell). The `bash` row ignores the
+  policy and serves as the positive control.
 - **resource**: 8 exhaustion probes: infinite loop, infinite recursion, fork bomb, memory, output flood, disk fill,
   huge brace expansion, sleep. A probe counts as *contained* only if the tool ends the run itself: before the
   harness's 20 s deadline, without being killed by a signal, under 1.5 GiB RSS, and under 90% of the 200 MB
@@ -70,11 +87,14 @@ evidence:
 - **conformance**: bash against bash gives 137/137;
 - **security**: bash (the known positive) escapes on every probe, and `null`, which runs nothing (the known negative),
   blocks every probe;
-- **resource**: `null` is contained.
+- **policy**: under bash every probe's effect is observed, and under `null` none is;
+- **resource**: `null` is contained, and bash is not contained on any probe.
 
 ## Configuration and caveats
 
-Each tool runs through its CLI, set up as a permissive agent workspace. The commands are in `tool_argv` in `run.py`.
+Outside the policy suite, each tool runs through its CLI, set up as a permissive agent workspace. The commands are in
+`tool_argv` in `run.py`. The policy suite instead uses the adapters in `adapters/`, which embed the library APIs
+(`policy_argv` in `run.py`).
 
 - **gbash**: `gbash-extras` (adds awk and jq) with `--root WORK` (a read-only host directory under an in-memory
   overlay).

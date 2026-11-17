@@ -24,3 +24,7 @@ clone rshell https://github.com/DataDog/rshell "$RSHELL_REV"
 
 mkdir -p "$T/jb" && (cd "$T/jb" && [ -f package.json ] || npm init -y >/dev/null) && (cd "$T/jb" && npm i -s "just-bash@$JUST_BASH_VERSION")
 mkdir -p "$T/ts" && (cd "$T/ts" && [ -f package.json ] || npm init -y >/dev/null) && (cd "$T/ts" && npm i -s "@tinysandbox/tinysandbox@$TINYSANDBOX_VERSION")
+
+# Policy adapters (bench/POLICY.md): Go programs embedding gbash and rshell against the clones above.
+(cd adapters/gbash-policy && GOWORK=off GOFLAGS=-mod=mod go build -o ../../.tools/bin/gbash-policy .)
+(cd adapters/rshell-policy && GOWORK=off GOFLAGS=-mod=mod go build -o ../../.tools/bin/rshell-policy .)
