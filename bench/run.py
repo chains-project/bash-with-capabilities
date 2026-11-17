@@ -538,7 +538,7 @@ def versions() -> dict:
     pkg = lambda p: json.loads((TOOLS_DIR / p / "package.json").read_text())["version"]
     return {"bash": sh(["bash", "--version"]), "gbash": "git " + rev("gbash"), "rshell": "git " + rev("rshell"),
             "just-bash": pkg("jb/node_modules/just-bash"), "tinysandbox": pkg("ts/node_modules/@tinysandbox/tinysandbox"),
-            "host": f"{platform.node()} {platform.platform()}", "date": time.strftime("%Y-%m-%d %H:%M")}
+            "host": platform.platform(), "date": time.strftime("%Y-%m-%d %H:%M")}
 
 
 def summarize(rows: list[dict], tools: list[str]) -> str:
