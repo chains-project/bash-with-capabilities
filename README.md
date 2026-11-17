@@ -7,6 +7,8 @@ shell runtime with three properties:
 - a declarative capability policy restricting what an agent can do;
 - a policy one can reason about and, ideally, prove things about.
 
+Sister project: [python-with-capabilities](https://github.com/chains-project/python-with-capabilities).
+
 The repository holds a survey of prior art and a reproducible benchmark of the existing bash reimplementations for
 agents.
 
